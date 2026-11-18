@@ -1,0 +1,57 @@
+# AudioVolumeControl - injected by Pocket Toolbox
+module AudioVolumeControl
+  BGM_VOLUME = {{BGM_VOLUME}}
+  BGS_VOLUME = {{BGS_VOLUME}}
+  SE_VOLUME  = {{SE_VOLUME}}
+  ME_VOLUME  = {{ME_VOLUME}}
+  SKIP_STARTUP_SPLASH = {{SKIP_STARTUP_SPLASH}}
+
+  def self.scale(value, percent)
+    [[(value.to_i * percent / 100.0).round, 0].max, 100].min
+  end
+end
+
+if AudioVolumeControl::SKIP_STARTUP_SPLASH && defined?(SceneManager) &&
+    SceneManager.respond_to?(:first_scene_class) && defined?(Scene_Title)
+  class << SceneManager
+    unless method_defined?(:audio_volume_control_original_first_scene_class)
+      alias_method :audio_volume_control_original_first_scene_class, :first_scene_class
+    end
+
+    def first_scene_class
+      scene_class = audio_volume_control_original_first_scene_class
+      return scene_class if $BTEST
+      scene_name = scene_class.respond_to?(:name) ? scene_class.name.to_s : ""
+      scene_name =~ /(splash|logo)/i ? Scene_Title : scene_class
+    end
+  end
+end
+
+module Audio
+  class << self
+    alias_method :audio_volume_control_original_bgm_play, :bgm_play unless method_defined?(:audio_volume_control_original_bgm_play)
+    alias_method :audio_volume_control_original_bgs_play, :bgs_play unless method_defined?(:audio_volume_control_original_bgs_play)
+    alias_method :audio_volume_control_original_se_play, :se_play unless method_defined?(:audio_volume_control_original_se_play)
+    alias_method :audio_volume_control_original_me_play, :me_play unless method_defined?(:audio_volume_control_original_me_play)
+
+    def bgm_play(filename, volume = 100, pitch = 100, pos = 0)
+      audio_volume_control_original_bgm_play(
+        filename, AudioVolumeControl.scale(volume, AudioVolumeControl::BGM_VOLUME), pitch, pos)
+    end
+
+    def bgs_play(filename, volume = 100, pitch = 100, pos = 0)
+      audio_volume_control_original_bgs_play(
+        filename, AudioVolumeControl.scale(volume, AudioVolumeControl::BGS_VOLUME), pitch, pos)
+    end
+
+    def se_play(filename, volume = 100, pitch = 100)
+      audio_volume_control_original_se_play(
+        filename, AudioVolumeControl.scale(volume, AudioVolumeControl::SE_VOLUME), pitch)
+    end
+
+    def me_play(filename, volume = 100, pitch = 100)
+      audio_volume_control_original_me_play(
+        filename, AudioVolumeControl.scale(volume, AudioVolumeControl::ME_VOLUME), pitch)
+    end
+  end
+end

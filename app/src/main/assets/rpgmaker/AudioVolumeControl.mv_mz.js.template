@@ -1,0 +1,102 @@
+/*:
+ * @target MV MZ
+ * @plugindesc Audio volume and startup controls injected by Pocket Toolbox.
+ * @author Pocket Toolbox
+ *
+ * @param BGMVolume
+ * @text BGM Volume
+ * @type number
+ * @min 0
+ * @max 100
+ * @default {{BGM_VOLUME}}
+ *
+ * @param BGSVolume
+ * @text BGS Volume
+ * @type number
+ * @min 0
+ * @max 100
+ * @default {{BGS_VOLUME}}
+ *
+ * @param SEVolume
+ * @text SE Volume
+ * @type number
+ * @min 0
+ * @max 100
+ * @default {{SE_VOLUME}}
+ *
+ * @param MEVolume
+ * @text ME Volume
+ * @type number
+ * @min 0
+ * @max 100
+ * @default {{ME_VOLUME}}
+ *
+ * @param SkipStartupSplash
+ * @text Skip startup splash
+ * @type boolean
+ * @on Skip
+ * @off Keep
+ * @default {{SKIP_STARTUP_SPLASH}}
+ *
+ * @help Applies the configured BGM, BGS, SE and ME master volumes whenever
+ * ConfigManager loads. It can also skip RPG Maker MZ's built-in startup
+ * splash. Known splash plugins are disabled in plugins.js by the injector.
+ */
+(function() {
+    "use strict";
+    var pluginName = "AudioVolumeControl";
+    var parameters = PluginManager.parameters(pluginName);
+
+    function readVolume(name, fallback) {
+        var value = Number(parameters[name]);
+        if (!isFinite(value)) value = fallback;
+        return Math.max(0, Math.min(100, Math.round(value)));
+    }
+
+    function readBoolean(name, fallback) {
+        var value = parameters[name];
+        if (value === undefined || value === "") return fallback;
+        return String(value).toLowerCase() === "true";
+    }
+
+    var volumes = {
+        bgm: readVolume("BGMVolume", {{BGM_VOLUME}}),
+        bgs: readVolume("BGSVolume", {{BGS_VOLUME}}),
+        se: readVolume("SEVolume", {{SE_VOLUME}}),
+        me: readVolume("MEVolume", {{ME_VOLUME}})
+    };
+    var skipStartupSplash = readBoolean("SkipStartupSplash", {{SKIP_STARTUP_SPLASH}});
+
+    function applyVolumes() {
+        if (typeof ConfigManager === "undefined") return;
+        ConfigManager.bgmVolume = volumes.bgm;
+        ConfigManager.bgsVolume = volumes.bgs;
+        ConfigManager.seVolume = volumes.se;
+        ConfigManager.meVolume = volumes.me;
+    }
+
+    if (typeof ConfigManager !== "undefined") {
+        var originalApplyData = ConfigManager.applyData;
+        ConfigManager.applyData = function(config) {
+            originalApplyData.call(this, config);
+            applyVolumes();
+        };
+    }
+    applyVolumes();
+
+    if (skipStartupSplash &&
+            typeof SceneManager !== "undefined" &&
+            typeof Scene_Boot !== "undefined" &&
+            typeof Scene_Title !== "undefined") {
+        var originalGoto = SceneManager.goto;
+        SceneManager.goto = function(sceneClass) {
+            var fromBoot = this._scene && this._scene.constructor === Scene_Boot;
+            var isMZ = typeof Utils !== "undefined" && Utils.RPGMAKER_NAME === "MZ";
+            var isBuiltInSplash = typeof Scene_Splash !== "undefined" && sceneClass === Scene_Splash;
+            if (fromBoot && isMZ && isBuiltInSplash) {
+                return originalGoto.call(this, Scene_Title);
+            }
+            return originalGoto.apply(this, arguments);
+        };
+    }
+})();

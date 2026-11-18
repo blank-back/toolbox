@@ -63,7 +63,6 @@ import androidx.compose.material.icons.rounded.QrCode2
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.SkipNext
 import androidx.compose.material.icons.rounded.SkipPrevious
-import androidx.compose.material.icons.rounded.UploadFile
 import androidx.compose.material.icons.rounded.VideoFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -108,6 +107,10 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.pockettoolbox.app.ToolboxViewModel
 import com.pockettoolbox.app.VirusTotalUiState
+import com.pockettoolbox.app.LocalMediaPlaybackBus
+import com.pockettoolbox.app.MusicPlaybackCompanionService
+import com.pockettoolbox.app.PlaybackNavigationBus
+import com.pockettoolbox.app.PlaybackTarget
 import com.pockettoolbox.app.model.BiliHistoryEntry
 import com.pockettoolbox.app.model.BiliMediaInfo
 import com.pockettoolbox.app.model.DownloadKind
@@ -116,6 +119,7 @@ import com.pockettoolbox.app.model.MusicHistoryEntry
 import com.pockettoolbox.app.model.MusicLyricLine
 import com.pockettoolbox.app.model.MusicPlaylist
 import com.pockettoolbox.app.model.MusicTrack
+import com.pockettoolbox.app.model.LocalMediaItem
 import com.pockettoolbox.app.model.PlaylistPlaybackMode
 import com.pockettoolbox.app.model.QrHistoryEntry
 import com.pockettoolbox.app.model.QrSecurityStatus
@@ -137,6 +141,7 @@ import kotlinx.coroutines.launch
 private enum class Screen {
     HOME,
     QR,
+    QR_SCANNER,
     QR_HISTORY,
     QR_SECURITY,
     BILI,
@@ -144,6 +149,10 @@ private enum class Screen {
     MUSIC,
     MUSIC_HISTORY,
     MUSIC_PLAYLISTS,
+    MEDIA,
+    MEDIA_PLAYER,
+    VIDEO_EDITOR,
+    GAME_EXTRACTION,
 }
 
 private data class MusicSourceOption(val value: String, val label: String)
@@ -170,8 +179,16 @@ private const val MUSIC_SECTION_SEARCH = 0
 private const val MUSIC_SECTION_PLAYER = 1
 
 @Composable
-fun ToolboxApp(viewModel: ToolboxViewModel) {
+fun ToolboxApp(
+    viewModel: ToolboxViewModel,
+    isInPictureInPictureMode: Boolean = false,
+    onEnterPictureInPicture: (Int, Int) -> Unit = { _, _ -> },
+) {
     var screen by rememberSaveable { mutableStateOf(Screen.HOME) }
+    var editorItem by remember { mutableStateOf<LocalMediaItem?>(null) }
+    val localMediaState = rememberLocalMediaFeatureState()
+    val gameExtractionState = rememberGameExtractionState()
+    val navigationTarget by PlaybackNavigationBus.target.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
@@ -184,14 +201,35 @@ fun ToolboxApp(viewModel: ToolboxViewModel) {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
+    LaunchedEffect(navigationTarget) {
+        navigationTarget?.let { target ->
+            screen = when (target) {
+                PlaybackTarget.MUSIC -> Screen.MUSIC
+                PlaybackTarget.LOCAL_MEDIA -> if (LocalMediaPlaybackBus.state.value.uri != null) {
+                    Screen.MEDIA_PLAYER
+                } else {
+                    Screen.MEDIA
+                }
+            }
+            PlaybackNavigationBus.consume(target)
+        }
+    }
+    val openEditor: (LocalMediaItem) -> Unit = { item ->
+        MusicPlaybackCompanionService.stopLocal(context)
+        editorItem = item
+        screen = Screen.VIDEO_EDITOR
+    }
     val goBack = {
         screen = when (screen) {
+            Screen.QR_SCANNER -> Screen.QR
             Screen.QR_HISTORY -> Screen.QR
             Screen.QR_SECURITY -> Screen.QR
             Screen.BILI_HISTORY -> Screen.BILI
             Screen.MUSIC_HISTORY -> Screen.MUSIC
             Screen.MUSIC_PLAYLISTS -> Screen.MUSIC
-            Screen.QR, Screen.BILI, Screen.MUSIC -> Screen.HOME
+            Screen.MEDIA_PLAYER -> Screen.MEDIA
+            Screen.VIDEO_EDITOR -> Screen.MEDIA
+            Screen.QR, Screen.BILI, Screen.MUSIC, Screen.MEDIA, Screen.GAME_EXTRACTION -> Screen.HOME
             Screen.HOME -> Screen.HOME
         }
     }
@@ -201,28 +239,38 @@ fun ToolboxApp(viewModel: ToolboxViewModel) {
         containerColor = Paper,
         modifier = Modifier.fillMaxSize(),
         topBar = {
-            AppHeader(
-                canGoBack = screen != Screen.HOME,
-                onHome = { screen = Screen.HOME },
-                onBack = goBack,
-            )
+            if (screen != Screen.QR_SCANNER && !isInPictureInPictureMode) {
+                AppHeader(
+                    canGoBack = screen != Screen.HOME,
+                    onHome = { screen = Screen.HOME },
+                    onBack = goBack,
+                )
+            }
         },
     ) { padding ->
         AnimatedContent(
             targetState = screen,
             label = "screen",
-            modifier = Modifier.padding(padding),
+            modifier = if (screen == Screen.QR_SCANNER) Modifier else Modifier.padding(padding),
         ) { target ->
             when (target) {
                 Screen.HOME -> HomeScreen(
                     onQr = { screen = Screen.QR },
                     onBili = { screen = Screen.BILI },
                     onMusic = { screen = Screen.MUSIC },
+                    onMedia = { screen = Screen.MEDIA },
+                    onGameExtraction = { screen = Screen.GAME_EXTRACTION },
                 )
                 Screen.QR -> QrScreen(
                     viewModel = viewModel,
+                    onOpenScanner = { screen = Screen.QR_SCANNER },
                     onHistory = { screen = Screen.QR_HISTORY },
                     onSecurity = { screen = Screen.QR_SECURITY },
+                )
+                Screen.QR_SCANNER -> QrCameraScreen(
+                    viewModel = viewModel,
+                    onFinished = { screen = Screen.QR },
+                    onBack = { screen = Screen.QR },
                 )
                 Screen.QR_HISTORY -> QrHistoryScreen(viewModel)
                 Screen.QR_SECURITY -> VirusTotalSettingsScreen(viewModel)
@@ -249,6 +297,51 @@ fun ToolboxApp(viewModel: ToolboxViewModel) {
                         screen = Screen.MUSIC
                     },
                 )
+                Screen.MEDIA -> LocalMediaLibraryScreen(
+                    state = localMediaState,
+                    onPlay = { item ->
+                        requestMusicNotificationPermission()
+                        MusicPlaybackCompanionService.playLocal(context, item)
+                        screen = Screen.MEDIA_PLAYER
+                    },
+                    onOpenPlayer = { screen = Screen.MEDIA_PLAYER },
+                    onEdit = openEditor,
+                )
+                Screen.MEDIA_PLAYER -> LocalMediaPlayerScreen(
+                    isInPictureInPictureMode = isInPictureInPictureMode,
+                    onEnterPictureInPicture = onEnterPictureInPicture,
+                    onEdit = {
+                        val playback = LocalMediaPlaybackBus.state.value
+                        val uri = playback.uri
+                        if (uri != null) {
+                            openEditor(
+                                localMediaState.items.firstOrNull { it.uri == uri } ?: LocalMediaItem(
+                                    uri = uri,
+                                    name = playback.title,
+                                    extension = playback.title.substringAfterLast('.', "").lowercase(),
+                                    mimeType = null,
+                                    sizeBytes = 0L,
+                                    durationMillis = playback.durationMillis,
+                                    width = playback.width,
+                                    height = playback.height,
+                                    isVideo = playback.isVideo,
+                                ),
+                            )
+                        }
+                    },
+                )
+                Screen.VIDEO_EDITOR -> editorItem?.let { VideoEditorScreen(it) }
+                    ?: LocalMediaLibraryScreen(
+                        state = localMediaState,
+                        onPlay = { item ->
+                            requestMusicNotificationPermission()
+                            MusicPlaybackCompanionService.playLocal(context, item)
+                            screen = Screen.MEDIA_PLAYER
+                        },
+                        onOpenPlayer = { screen = Screen.MEDIA_PLAYER },
+                        onEdit = openEditor,
+                    )
+                Screen.GAME_EXTRACTION -> GameExtractionScreen(gameExtractionState)
             }
         }
     }
@@ -297,7 +390,13 @@ private fun AppHeader(canGoBack: Boolean, onHome: () -> Unit, onBack: () -> Unit
 }
 
 @Composable
-private fun HomeScreen(onQr: () -> Unit, onBili: () -> Unit, onMusic: () -> Unit) {
+private fun HomeScreen(
+    onQr: () -> Unit,
+    onBili: () -> Unit,
+    onMusic: () -> Unit,
+    onMedia: () -> Unit,
+    onGameExtraction: () -> Unit,
+) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -317,8 +416,8 @@ private fun HomeScreen(onQr: () -> Unit, onBili: () -> Unit, onMusic: () -> Unit
         Spacer(Modifier.height(38.dp))
         ToolCard(
             number = "01",
-            title = "二维码提取",
-            subtitle = "从图片识别二维码，复制或按需打开地址",
+            title = "二维码工具",
+            subtitle = "二维码生成、识别及安全检测",
             background = Sage,
             icon = { Icon(Icons.Rounded.QrCode2, null, tint = Green, modifier = Modifier.size(64.dp)) },
             onClick = onQr,
@@ -345,6 +444,29 @@ private fun HomeScreen(onQr: () -> Unit, onBili: () -> Unit, onMusic: () -> Unit
             background = Color(0xFFE8DFEA),
             icon = { Icon(Icons.Rounded.LibraryMusic, null, tint = Color(0xFF76507B), modifier = Modifier.size(64.dp)) },
             onClick = onMusic,
+        )
+        Spacer(Modifier.height(14.dp))
+        ToolCard(
+            number = "04",
+            title = "本地媒体",
+            subtitle = "后台播放、画中画、目录扫描与音视频剪辑",
+            background = Color(0xFFE9E3D7),
+            icon = { Icon(Icons.Rounded.VideoFile, null, tint = Orange, modifier = Modifier.size(64.dp)) },
+            onClick = onMedia,
+        )
+        Spacer(Modifier.height(14.dp))
+        ToolCard(
+            number = "05",
+            title = "游戏资源",
+            subtitle = "游戏资源解密与代码逆向导出",
+            background = Sage.copy(alpha = .75f),
+            icon = {
+                Box(
+                    Modifier.size(64.dp).clip(RoundedCornerShape(16.dp)).background(Green),
+                    contentAlignment = Alignment.Center,
+                ) { Text("解", color = Color.White, fontFamily = FontFamily.Serif, fontSize = 27.sp, fontWeight = FontWeight.Bold) }
+            },
+            onClick = onGameExtraction,
         )
     }
 }
@@ -399,27 +521,34 @@ private fun Eyebrow(text: String) {
 @Composable
 private fun QrScreen(
     viewModel: ToolboxViewModel,
+    onOpenScanner: () -> Unit,
     onHistory: () -> Unit,
     onSecurity: () -> Unit,
 ) {
     val state by viewModel.qrState.collectAsStateWithLifecycle()
+    val generatorState by viewModel.qrGeneratorState.collectAsStateWithLifecycle()
     val hasVirusTotalApiKey by viewModel.hasVirusTotalApiKey.collectAsStateWithLifecycle()
+    val securityDisclaimerAccepted by viewModel.qrSecurityDisclaimerAccepted.collectAsStateWithLifecycle()
     val virusTotalStates by viewModel.virusTotalStates.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var showApiKeyDialog by rememberSaveable { mutableStateOf(false) }
+    var showSecurityDisclaimer by rememberSaveable { mutableStateOf(false) }
     var pendingVirusTotalUrl by rememberSaveable { mutableStateOf<String?>(null) }
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        uri?.let(viewModel::scanQr)
+    var virusTotalUrlAwaitingApiKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var manualUrlInput by rememberSaveable { mutableStateOf("") }
+    val saveGeneratedQr = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("image/png"),
+    ) { uri ->
+        uri?.let(viewModel::saveGeneratedQr)
     }
-
     Column(
         modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).navigationBarsPadding().padding(20.dp),
     ) {
-        PageHeading("01", "二维码提取", "图片只在本机内存中解析，不会上传。识别出的地址也不会自动访问。")
+        PageHeading("01", "二维码工具", "")
         OutlinedButton(onClick = onHistory, modifier = Modifier.fillMaxWidth()) {
             Icon(Icons.Rounded.History, null)
             Spacer(Modifier.width(8.dp))
-            Text("识别历史")
+            Text("识别与检测历史")
         }
         Spacer(Modifier.height(8.dp))
         OutlinedButton(onClick = onSecurity, modifier = Modifier.fillMaxWidth()) {
@@ -427,37 +556,118 @@ private fun QrScreen(
             Spacer(Modifier.width(8.dp))
             Text("VirusTotal 设置与 API key 教程")
         }
-        Spacer(Modifier.height(12.dp))
-        Card(
-            colors = CardDefaults.cardColors(containerColor = BluePaper.copy(alpha = .7f)),
-            shape = RoundedCornerShape(14.dp),
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = { showSecurityDisclaimer = true },
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Column(Modifier.padding(14.dp)) {
-                Text("来源与免责声明", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                Spacer(Modifier.height(5.dp))
+            Text(
+                    "使用安全检测前请先阅读"
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Card(
+            colors = CardDefaults.cardColors(containerColor = SurfacePaper.copy(alpha = .75f)),
+            shape = RoundedCornerShape(18.dp),
+            modifier = Modifier.fillMaxWidth().border(1.dp, Line, RoundedCornerShape(18.dp)),
+        ) {
+            Column(Modifier.fillMaxWidth().padding(14.dp)) {
+                Text("链接生成与安全检测", fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 Text(
-                    "二维码内容由本地 ZXing 识别；可选的链接安全报告来自 VirusTotal。检测前会再次确认，只有确认后完整 URL 才会发送给 VirusTotal。结果仅供参考，未命中不等于绝对安全，本应用及第三方检测引擎均不对结果作安全保证。请勿提交私密或含敏感信息的 URL。",
+                    "未填写协议时默认使用 https://",
                     color = Muted,
                     fontSize = 10.sp,
-                    lineHeight = 16.sp,
+                    lineHeight = 15.sp,
                 )
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = manualUrlInput,
+                    onValueChange = { if (it.length <= 4096) manualUrlInput = it },
+                    label = { Text("链接") },
+                    placeholder = { Text("https://example.com") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { viewModel.generateQrForUrl(manualUrlInput) }),
+                    minLines = 1,
+                    maxLines = 3,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(10.dp))
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = { viewModel.generateQrForUrl(manualUrlInput) },
+                        enabled = !generatorState.busy,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(Icons.Rounded.QrCode2, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(5.dp))
+                        Text("生成二维码")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            viewModel.prepareManualUrlForSecurity(manualUrlInput)?.let { url ->
+                                if (hasVirusTotalApiKey) pendingVirusTotalUrl = url
+                                else {
+                                    virusTotalUrlAwaitingApiKey = url
+                                    showApiKeyDialog = true
+                                }
+                            }
+                        },
+                        enabled = !state.busy && securityDisclaimerAccepted,
+                        modifier = Modifier.weight(1f),
+                    ) {
+                        Icon(Icons.Rounded.Link, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(5.dp))
+                        Text("检测安全性")
+                    }
+                }
+                StatusBlock(generatorState.busy, generatorState.message, generatorState.isError)
+                generatorState.bitmap?.let { bitmap ->
+                    Spacer(Modifier.height(14.dp))
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = "生成的二维码",
+                        contentScale = ContentScale.Fit,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(280.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color.White)
+                            .padding(12.dp),
+                    )
+                    generatorState.webUrl?.let { url ->
+                        Spacer(Modifier.height(8.dp))
+                        ExpandableQrText(text = url, color = Ink)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = {
+                            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(Date())
+                            saveGeneratedQr.launch("qrcode_$timestamp.png")
+                        },
+                        enabled = !generatorState.busy,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(Icons.Rounded.Download, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(7.dp))
+                        Text("选择位置保存为 PNG")
+                    }
+                }
             }
         }
         Spacer(Modifier.height(14.dp))
         if (state.preview == null) {
             Card(
-                onClick = { picker.launch(arrayOf("image/*")) },
+                onClick = onOpenScanner,
                 colors = CardDefaults.cardColors(containerColor = SurfacePaper.copy(alpha = .65f)),
                 shape = RoundedCornerShape(22.dp),
                 modifier = Modifier.fillMaxWidth().height(290.dp).border(1.dp, Line, RoundedCornerShape(22.dp)),
             ) {
                 Column(Modifier.fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-                    Icon(Icons.Rounded.UploadFile, null, tint = Green, modifier = Modifier.size(52.dp))
+                    Icon(Icons.Rounded.QrCode2, null, tint = Green, modifier = Modifier.size(52.dp))
                     Spacer(Modifier.height(17.dp))
-                    Text("选择一张图片", fontFamily = FontFamily.Serif, fontSize = 23.sp, fontWeight = FontWeight.Bold)
+                    Text("扫码或选择图片", fontFamily = FontFamily.Serif, fontSize = 23.sp, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(7.dp))
-                    Text("支持系统相册、文件和云盘", color = Muted, fontSize = 12.sp)
+                    Text("点击先打开相机，也可从扫码页进入相册", color = Muted, fontSize = 12.sp)
                 }
             }
         } else {
@@ -467,7 +677,7 @@ private fun QrScreen(
                 contentScale = ContentScale.Fit,
                 modifier = Modifier.fillMaxWidth().height(260.dp).clip(RoundedCornerShape(18.dp)).background(Line.copy(alpha = .4f)),
             )
-            TextButton(onClick = { picker.launch(arrayOf("image/*")) }) { Text("更换图片") }
+            TextButton(onClick = onOpenScanner) { Text("重新扫码或选择图片") }
         }
         StatusBlock(state.busy, state.message, state.isError)
         state.results.forEachIndexed { index, result ->
@@ -494,9 +704,12 @@ private fun QrScreen(
                     OutlinedButton(
                         onClick = {
                             if (hasVirusTotalApiKey) pendingVirusTotalUrl = url
-                            else showApiKeyDialog = true
+                            else {
+                                virusTotalUrlAwaitingApiKey = url
+                                showApiKeyDialog = true
+                            }
                         },
-                        enabled = virusTotalState?.busy != true,
+                        enabled = securityDisclaimerAccepted && virusTotalState?.busy != true,
                         modifier = Modifier.fillMaxWidth(),
                     ) {
                         if (virusTotalState?.busy == true) {
@@ -508,6 +721,7 @@ private fun QrScreen(
                     virusTotalState?.let { check ->
                         VirusTotalResultBlock(
                             state = check,
+                            refreshEnabled = securityDisclaimerAccepted,
                             onRefresh = { viewModel.refreshVirusTotal(url) },
                             onOpenReport = { reportUrl -> openWebUrl(context, reportUrl) },
                         )
@@ -517,11 +731,29 @@ private fun QrScreen(
         }
     }
 
+    if (showSecurityDisclaimer) {
+        QrSecurityDisclaimerDialog(
+            accepted = securityDisclaimerAccepted,
+            onAccept = {
+                viewModel.acceptQrSecurityDisclaimer()
+                showSecurityDisclaimer = false
+            },
+            onDismiss = { showSecurityDisclaimer = false },
+        )
+    }
+
     if (showApiKeyDialog) {
         VirusTotalApiKeyDialog(
             title = if (hasVirusTotalApiKey) "更改 API key" else "首次使用：设置 API key",
-            onDismiss = { showApiKeyDialog = false },
-            onSave = viewModel::saveVirusTotalApiKey,
+            onDismiss = {
+                showApiKeyDialog = false
+                virusTotalUrlAwaitingApiKey = null
+            },
+            onSave = { apiKey ->
+                viewModel.saveVirusTotalApiKey(apiKey).also { saved ->
+                    if (saved) pendingVirusTotalUrl = virusTotalUrlAwaitingApiKey
+                }
+            },
         )
     }
     pendingVirusTotalUrl?.let { url ->
@@ -592,6 +824,7 @@ private fun ExpandableQrText(
 @Composable
 private fun VirusTotalResultBlock(
     state: VirusTotalUiState,
+    refreshEnabled: Boolean,
     onRefresh: () -> Unit,
     onOpenReport: (String) -> Unit,
 ) {
@@ -618,7 +851,7 @@ private fun VirusTotalResultBlock(
                     Text("报告时间：${formatHistoryTime(it * 1_000L)}", color = Muted, fontSize = 10.sp)
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = onRefresh, enabled = !state.busy) { Text("刷新") }
+                    TextButton(onClick = onRefresh, enabled = refreshEnabled && !state.busy) { Text("刷新") }
                     TextButton(onClick = { onOpenReport(report.reportUrl) }) {
                         Text("查看来源")
                         Icon(Icons.Rounded.ArrowOutward, null, Modifier.size(15.dp))
@@ -629,9 +862,59 @@ private fun VirusTotalResultBlock(
         }
     } ?: run {
         if (state.analysisId != null) {
-            TextButton(onClick = onRefresh, enabled = !state.busy) { Text("手动刷新扫描结果") }
+            TextButton(onClick = onRefresh, enabled = refreshEnabled && !state.busy) {
+                Text("手动刷新扫描结果")
+            }
         }
     }
+}
+
+@Composable
+private fun QrSecurityDisclaimerDialog(
+    accepted: Boolean,
+    onAccept: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val disclaimerText = remember(context) {
+        runCatching {
+            context.assets.open("legal/qr_security_disclaimer.md")
+                .bufferedReader(Charsets.UTF_8)
+                .use { it.readText() }
+        }.getOrElse {
+            "免责声明内容加载失败，请稍后重试。"
+        }
+            .lineSequence()
+            .filterNot { it.trim() == "## 二维码安全检测免责声明" }
+            .joinToString("\n") { line ->
+                line.replace("**", "").replace(Regex("^#{1,6}\\s+"), "")
+            }
+            .trim()
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("二维码安全检测免责声明") },
+        text = {
+            Text(
+                text = disclaimerText,
+                color = Ink,
+                fontSize = 12.sp,
+                lineHeight = 19.sp,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 520.dp)
+                    .verticalScroll(rememberScrollState()),
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = onAccept) { Text(if (accepted) "关闭" else "已阅") }
+        },
+        dismissButton = {
+            if (!accepted) {
+                TextButton(onClick = onDismiss) { Text("暂不使用") }
+            }
+        },
+    )
 }
 
 @Composable
@@ -648,7 +931,7 @@ private fun VirusTotalApiKeyDialog(
         title = { Text(title) },
         text = {
             Column {
-                Text("API key 将由 Android Keystore 的 AES-GCM 密钥加密保存，不会以明文写入偏好设置；界面也不会再次显示已保存的 key。")
+                Text("API key 将由 Android Keystore 的 AES-GCM 密钥加密保存")
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
                     value = input,
@@ -666,7 +949,7 @@ private fun VirusTotalApiKeyDialog(
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Spacer(Modifier.height(8.dp))
-                Text("key 仅在你确认检测时通过 HTTPS 发给 www.virustotal.com。", color = Muted, fontSize = 10.sp)
+                Text("key 仅在确认检测时通过 HTTPS 发送给 www.virustotal.com。", color = Muted, fontSize = 10.sp)
             }
         },
         confirmButton = {
@@ -682,8 +965,10 @@ private fun VirusTotalApiKeyDialog(
 @Composable
 private fun VirusTotalSettingsScreen(viewModel: ToolboxViewModel) {
     val hasApiKey by viewModel.hasVirusTotalApiKey.collectAsStateWithLifecycle()
+    val securityDisclaimerAccepted by viewModel.qrSecurityDisclaimerAccepted.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var showApiKeyDialog by rememberSaveable { mutableStateOf(false) }
+    var showSecurityDisclaimer by rememberSaveable { mutableStateOf(false) }
     var confirmRemoval by rememberSaveable { mutableStateOf(false) }
 
     Column(
@@ -693,7 +978,7 @@ private fun VirusTotalSettingsScreen(viewModel: ToolboxViewModel) {
             .navigationBarsPadding()
             .padding(20.dp),
     ) {
-        PageHeading("01 · SECURITY", "VirusTotal 设置", "管理 API key，并查看获取方法、数据发送范围和检测免责声明。")
+        PageHeading("01 · SECURITY", "VirusTotal 设置", "管理 API key")
         Card(
             colors = CardDefaults.cardColors(containerColor = SurfacePaper),
             shape = RoundedCornerShape(16.dp),
@@ -703,7 +988,7 @@ private fun VirusTotalSettingsScreen(viewModel: ToolboxViewModel) {
                 Text(if (hasApiKey) "API key 已加密保存" else "尚未设置 API key", fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "使用 Android Keystore + AES-GCM。应用只保存密文与随机 IV，不提供已保存 key 的明文查看功能。",
+                    "使用 Android Keystore + AES-GCM",
                     color = Muted,
                     fontSize = 11.sp,
                     lineHeight = 17.sp,
@@ -723,7 +1008,7 @@ private fun VirusTotalSettingsScreen(viewModel: ToolboxViewModel) {
         Text("如何获取 API key", fontFamily = FontFamily.Serif, fontWeight = FontWeight.Bold, fontSize = 24.sp)
         Spacer(Modifier.height(12.dp))
         Text(
-            "1. 打开 VirusTotal Community 注册页面并创建账户。\n\n2. 登录后进入 My API Key 页面。\n\n3. 复制页面显示的 API key，返回本应用点击“输入 API key”并保存。\n\n4. 回到二维码提取页，识别 HTTP(S) 链接后点击 VirusTotal 检测。每次发送 URL 前都会要求确认。",
+            "1. 打开 VirusTotal Community 注册页面并创建账户。\n\n2. 登录后进入 My API Key 页面。\n\n3. 复制页面显示的 API key，返回本应用点击“输入 API key”并保存。\n\n4. 回到二维码工具页，识别二维码或直接输入 HTTP(S) 链接后点击安全检测。每次发送 URL 前都会要求确认。",
             fontSize = 13.sp,
             lineHeight = 20.sp,
         )
@@ -731,39 +1016,40 @@ private fun VirusTotalSettingsScreen(viewModel: ToolboxViewModel) {
         OutlinedButton(
             onClick = { openWebUrl(context, "https://www.virustotal.com/gui/join-us") },
             modifier = Modifier.fillMaxWidth(),
-        ) { Text("打开账户注册页面") }
+        ) { Text("注册VirusTotal账户") }
         Spacer(Modifier.height(8.dp))
         OutlinedButton(
             onClick = { openWebUrl(context, "https://www.virustotal.com/gui/my-apikey") },
             modifier = Modifier.fillMaxWidth(),
-        ) { Text("打开 My API Key 页面") }
+        ) { Text("获取API Key") }
         Spacer(Modifier.height(8.dp))
         TextButton(
             onClick = { openWebUrl(context, "https://docs.virustotal.com/docs/please-give-me-an-api-key") },
             modifier = Modifier.fillMaxWidth(),
         ) { Text("阅读 VirusTotal 官方 API key 教程") }
         Spacer(Modifier.height(20.dp))
-        Card(
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFEEE5CF)),
-            shape = RoundedCornerShape(14.dp),
+        OutlinedButton(
+            onClick = { showSecurityDisclaimer = true },
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Column(Modifier.padding(15.dp)) {
-                Text("使用限制、来源与免责声明", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "VirusTotal 公共 API 的默认额度较低（官方文档标注为每分钟 4 次），且受其服务条款和使用限制约束。本应用不会自动高频轮询。完整 URL 可能包含路径、查询参数或敏感令牌，请确认不含隐私信息后再提交。安全统计与分类来源于 VirusTotal 及其第三方检测引擎，仅供参考，可能存在误报、漏报或报告滞后；无命中不代表安全，也不构成任何保证或专业建议。",
-                    color = Ink,
-                    fontSize = 10.sp,
-                    lineHeight = 16.sp,
-                )
-            }
+            Text(if (securityDisclaimerAccepted) "安全检测免责声明：已阅" else "阅读安全检测免责声明")
         }
         Spacer(Modifier.height(10.dp))
         TextButton(
             onClick = { openWebUrl(context, "https://docs.virustotal.com/docs/api-overview") },
             modifier = Modifier.fillMaxWidth(),
         ) { Text("查看 VirusTotal API 官方说明") }
+    }
+
+    if (showSecurityDisclaimer) {
+        QrSecurityDisclaimerDialog(
+            accepted = securityDisclaimerAccepted,
+            onAccept = {
+                viewModel.acceptQrSecurityDisclaimer()
+                showSecurityDisclaimer = false
+            },
+            onDismiss = { showSecurityDisclaimer = false },
+        )
     }
 
     if (showApiKeyDialog) {
@@ -803,10 +1089,10 @@ private fun QrHistoryScreen(viewModel: ToolboxViewModel) {
             .navigationBarsPadding()
             .padding(20.dp),
     ) {
-        PageHeading("01 · HISTORY", "识别历史", "记录二维码解析时间、识别内容及简要安全检测结果。只有明确点击链接时才会访问。")
+        PageHeading("01 · HISTORY", "识别与检测历史", "记录二维码解析或手动检测时间、链接及简要安全结果。只有明确点击链接时才会访问。")
         HistoryHeader(history.size, viewModel::clearQrHistory)
         if (history.isEmpty()) {
-            EmptyHistory("还没有二维码识别记录。")
+            EmptyHistory("还没有二维码识别或链接检测记录。")
         } else {
             history.pageSlice(safePage, HISTORY_PAGE_SIZE).forEachIndexed { index, entry ->
                 QrHistoryCard((safePage - 1) * HISTORY_PAGE_SIZE + index, entry, context)
@@ -846,7 +1132,7 @@ private fun QrHistoryCard(index: Int, entry: QrHistoryEntry, context: Context) {
             Spacer(Modifier.height(11.dp))
             QrSecurityHistoryBlock(entry)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                TextButton(onClick = { copyText(context, "二维码内容", entry.text) }) {
+                TextButton(onClick = { copyText(context, "链接或二维码内容", entry.text) }) {
                     Icon(Icons.Rounded.ContentCopy, null, Modifier.size(17.dp))
                     Spacer(Modifier.width(5.dp))
                     Text("复制")
@@ -955,14 +1241,12 @@ private fun BiliScreen(viewModel: ToolboxViewModel, onHistory: () -> Unit) {
     val selectDirectory: (DownloadKind?) -> Unit = { kind ->
         pendingKindName = kind?.name
         directoryLauncher.launch(
-            Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-                addFlags(
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
-                        Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
-                )
-            },
+            createDirectoryPickerIntent(
+                initialUri = primaryStorageRootDocumentUri(),
+                allowWrite = true,
+                showAppChooser = true,
+                chooserTitle = "选择 Bilibili 下载目录",
+            ),
         )
     }
 
@@ -974,7 +1258,7 @@ private fun BiliScreen(viewModel: ToolboxViewModel, onHistory: () -> Unit) {
             .navigationBarsPadding()
             .padding(20.dp),
     ) {
-        PageHeading("02", "Bilibili 媒体", "输入 BV / AU 号或包含它的链接。只在点击下载后保存内容。")
+        PageHeading("02", "Bilibili 媒体", "输入 BV / AU 号或链接")
         OutlinedButton(onClick = onHistory, modifier = Modifier.fillMaxWidth()) {
             Icon(Icons.Rounded.History, null)
             Spacer(Modifier.width(8.dp))
@@ -1002,7 +1286,6 @@ private fun BiliScreen(viewModel: ToolboxViewModel, onHistory: () -> Unit) {
             Spacer(Modifier.width(8.dp))
             Text("查询信息")
         }
-        Text("也可直接粘贴 bilibili.com 的视频或音频链接", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 7.dp))
         Spacer(Modifier.height(14.dp))
         Card(
             colors = CardDefaults.cardColors(containerColor = SurfacePaper),
@@ -1017,7 +1300,6 @@ private fun BiliScreen(viewModel: ToolboxViewModel, onHistory: () -> Unit) {
                 Spacer(Modifier.width(10.dp))
                 Column(Modifier.weight(1f)) {
                     Text(if (downloadTreeUri == null) "尚未选择保存目录" else "保存到 ${readableTreeName(downloadTreeUri)}", fontSize = 12.sp)
-                    Text("选择一次后，后续下载会直接保存", color = Muted, fontSize = 10.sp)
                 }
                 TextButton(onClick = { selectDirectory(null) }, enabled = !state.busy) {
                     Text(if (downloadTreeUri == null) "选择" else "更改")
@@ -1300,14 +1582,12 @@ private fun MusicScreen(
     val selectDirectory: (Boolean) -> Unit = { downloadAfterSelection ->
         chooseDirectoryThenDownload = downloadAfterSelection
         directoryLauncher.launch(
-            Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-                addFlags(
-                    Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
-                        Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
-                )
-            },
+            createDirectoryPickerIntent(
+                initialUri = primaryStorageRootDocumentUri(),
+                allowWrite = true,
+                showAppChooser = true,
+                chooserTitle = "选择音乐下载目录",
+            ),
         )
     }
 
@@ -1352,12 +1632,6 @@ private fun MusicScreen(
                 ) { Text("播放卡片") }
             }
         }
-        Text(
-            "可点击上方按钮或左右滑动切换；选择歌曲后会自动进入播放卡片。",
-            color = Muted,
-            fontSize = 9.sp,
-            modifier = Modifier.padding(top = 5.dp, bottom = 7.dp),
-        )
         HorizontalPager(
             state = musicSectionPagerState,
             modifier = Modifier.fillMaxWidth().weight(1f),
@@ -1385,7 +1659,7 @@ private fun MusicScreen(
                                     openWebUrl(context, "https://music.gdstudio.xyz/")
                                 },
                             )
-                            Text("应用内限制为 5 分钟最多 45 次请求。", color = Muted, fontSize = 10.sp)
+                            Text("5 分钟内最多进行 45 次请求", color = Muted, fontSize = 10.sp)
                         }
                     }
                     Spacer(Modifier.height(12.dp))
@@ -1408,12 +1682,6 @@ private fun MusicScreen(
                     ) {
                         Text("清除音乐缓存")
                     }
-                    Text(
-                        "播放会在缓冲数据可用后开始，并把同一读取链路写入本地 LRU 缓存。",
-                        color = Muted,
-                        fontSize = 10.sp,
-                        modifier = Modifier.padding(top = 5.dp),
-                    )
                     Spacer(Modifier.height(12.dp))
                     Box(Modifier.fillMaxWidth()) {
                         OutlinedButton(
@@ -1467,8 +1735,8 @@ private fun MusicScreen(
                         Spacer(Modifier.width(8.dp))
                         Text("搜索歌曲")
                     }
-                    Text("每次从当前选择的音乐源显示最多 30 条结果。切换音源不会自动发起请求。", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 7.dp))
-                    Text("请仅播放或下载你有权使用的内容，并遵守对应音乐平台及 API 服务规则。", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 3.dp))
+                    Text("每次从当前选择的音乐源显示最多 30 条结果。", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 7.dp))
+                    Text("请仅播放或下载你有权使用的内容，并遵守对应音乐平台规则。", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 3.dp))
                     StatusBlock(state.busy, state.message, state.isError)
 
                     if (state.results.isNotEmpty()) {
@@ -2289,12 +2557,7 @@ private fun musicSourceName(source: String): String = when (source.lowercase()) 
 }
 
 private fun readableTreeName(value: String?): String {
-    if (value == null) return "未选择"
-    return runCatching {
-        Uri.decode(Uri.parse(value).lastPathSegment.orEmpty())
-            .substringAfter(':')
-            .ifBlank { "已选择目录" }
-    }.getOrDefault("已选择目录")
+    return readableDirectoryLocation(value)
 }
 
 private fun formatHistoryTime(epochMillis: Long): String =

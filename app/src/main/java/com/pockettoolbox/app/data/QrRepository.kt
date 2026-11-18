@@ -3,6 +3,7 @@ package com.pockettoolbox.app.data
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.ImageDecoder
 import android.graphics.Matrix
 import android.net.Uri
@@ -11,8 +12,11 @@ import androidx.exifinterface.media.ExifInterface
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.BinaryBitmap
 import com.google.zxing.DecodeHintType
+import com.google.zxing.EncodeHintType
 import com.google.zxing.MultiFormatReader
 import com.google.zxing.NotFoundException
+import com.google.zxing.qrcode.QRCodeWriter
+import com.google.zxing.qrcode.decoder.ErrorCorrectionLevel
 import com.google.zxing.RGBLuminanceSource
 import com.google.zxing.common.HybridBinarizer
 import com.google.zxing.multi.GenericMultipleBarcodeReader
@@ -28,32 +32,82 @@ class QrRepository(private val context: Context) {
         val results: List<QrResult>,
     )
 
+    data class GeneratedQr(
+        val webUrl: String,
+        val bitmap: Bitmap,
+    )
+
     suspend fun scan(uri: Uri): ScanOutput {
         val bitmap = withContext(Dispatchers.IO) { loadBitmap(uri) }
-        return withContext(Dispatchers.Default) {
-            val pixels = IntArray(bitmap.width * bitmap.height)
-            bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
-            val source = RGBLuminanceSource(bitmap.width, bitmap.height, pixels)
-            val binary = BinaryBitmap(HybridBinarizer(source))
-            val hints = mapOf(
-                DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
-                DecodeHintType.TRY_HARDER to true,
-                DecodeHintType.CHARACTER_SET to "UTF-8",
-            )
-            val texts = try {
-                GenericMultipleBarcodeReader(MultiFormatReader())
-                    .decodeMultiple(binary, hints)
-                    .map { it.text }
-                    .filter(String::isNotBlank)
-                    .distinct()
-            } catch (_: NotFoundException) {
-                emptyList()
-            }
-            ScanOutput(
-                preview = bitmap,
-                results = texts.map { text -> QrResult(text, parseWebUrl(text)) },
-            )
+        return scan(bitmap)
+    }
+
+    suspend fun scan(bitmap: Bitmap): ScanOutput = withContext(Dispatchers.Default) {
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        val source = RGBLuminanceSource(bitmap.width, bitmap.height, pixels)
+        val binary = BinaryBitmap(HybridBinarizer(source))
+        val hints = mapOf(
+            DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE),
+            DecodeHintType.TRY_HARDER to true,
+            DecodeHintType.CHARACTER_SET to "UTF-8",
+        )
+        val texts = try {
+            GenericMultipleBarcodeReader(MultiFormatReader())
+                .decodeMultiple(binary, hints)
+                .map { it.text }
+                .filter(String::isNotBlank)
+                .distinct()
+        } catch (_: NotFoundException) {
+            emptyList()
         }
+        ScanOutput(
+            preview = bitmap,
+            results = texts.map { text -> QrResult(text, parseWebUrl(text)) },
+        )
+    }
+
+    suspend fun generateWebUrl(value: String): GeneratedQr = withContext(Dispatchers.Default) {
+        val webUrl = normalizeWebUrl(value) ?: error("请输入有效的 HTTP(S) 链接")
+        require(webUrl.toByteArray(Charsets.UTF_8).size <= MAX_GENERATED_URL_BYTES) {
+            "链接过长，无法生成可靠的二维码"
+        }
+        val matrix = QRCodeWriter().encode(
+            webUrl,
+            BarcodeFormat.QR_CODE,
+            GENERATED_QR_SIZE,
+            GENERATED_QR_SIZE,
+            mapOf(
+                EncodeHintType.CHARACTER_SET to "UTF-8",
+                EncodeHintType.ERROR_CORRECTION to ErrorCorrectionLevel.M,
+                EncodeHintType.MARGIN to GENERATED_QR_MARGIN,
+            ),
+        )
+        val pixels = IntArray(matrix.width * matrix.height)
+        for (y in 0 until matrix.height) {
+            val rowOffset = y * matrix.width
+            for (x in 0 until matrix.width) {
+                pixels[rowOffset + x] = if (matrix[x, y]) Color.BLACK else Color.WHITE
+            }
+        }
+        GeneratedQr(
+            webUrl = webUrl,
+            bitmap = Bitmap.createBitmap(pixels, matrix.width, matrix.height, Bitmap.Config.ARGB_8888),
+        )
+    }
+
+    suspend fun saveGeneratedQr(bitmap: Bitmap, destination: Uri) = withContext(Dispatchers.IO) {
+        val saved = context.contentResolver.openOutputStream(destination, "w")?.use { output ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+        } ?: false
+        check(saved) { "无法写入所选位置" }
+    }
+
+    fun normalizeWebUrl(value: String): String? {
+        val trimmed = value.trim()
+        if (trimmed.isEmpty() || trimmed.length > MAX_INPUT_URL_CHARS) return null
+        val candidate = if (SCHEME_PATTERN.containsMatchIn(trimmed)) trimmed else "https://$trimmed"
+        return parseWebUrl(candidate)
     }
 
     private fun loadBitmap(uri: Uri): Bitmap {
@@ -131,5 +185,10 @@ class QrRepository(private val context: Context) {
         // ZXing also creates an IntArray with one entry per pixel. Capping both
         // dimensions keeps the combined peak well below typical Android heaps.
         const val MAX_DIMENSION = 2560
+        const val GENERATED_QR_SIZE = 1024
+        const val GENERATED_QR_MARGIN = 3
+        const val MAX_INPUT_URL_CHARS = 4096
+        const val MAX_GENERATED_URL_BYTES = 2200
+        val SCHEME_PATTERN = Regex("^[A-Za-z][A-Za-z0-9+.-]*://")
     }
 }

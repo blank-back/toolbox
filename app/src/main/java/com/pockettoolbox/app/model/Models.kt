@@ -4,6 +4,28 @@ enum class MediaKind { VIDEO, AUDIO }
 
 enum class DownloadKind { COVER, VIDEO, AUDIO }
 
+data class LocalMediaItem(
+    val uri: String,
+    val name: String,
+    val extension: String,
+    val mimeType: String?,
+    val sizeBytes: Long,
+    val durationMillis: Long,
+    val width: Int = 0,
+    val height: Int = 0,
+    val isVideo: Boolean,
+)
+
+data class EditorAudioTrack(
+    val id: String,
+    val uri: String,
+    val name: String,
+    val durationMillis: Long,
+    val trimStartMillis: Long = 0L,
+    val trimEndMillis: Long = durationMillis,
+    val offsetMillis: Long = 0L,
+)
+
 data class BiliId(
     val value: String,
     val kind: MediaKind,

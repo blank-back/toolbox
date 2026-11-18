@@ -1,18 +1,20 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("net.mullvad.rust-android")
 }
 
 android {
     namespace = "com.pockettoolbox.app"
     compileSdk = 37
+    ndkVersion = "30.0.16248370"
 
     defaultConfig {
         applicationId = "com.pockettoolbox.app"
         minSdk = 26
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.6.0"
+        versionCode = 11
+        versionName = "1.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables.useSupportLibrary = true
@@ -20,6 +22,13 @@ android {
 
     buildFeatures {
         compose = true
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
     }
 
     compileOptions {
@@ -39,6 +48,20 @@ kotlin {
     }
 }
 
+cargo {
+    module = "../native/unity_asset_bridge"
+    libname = "pockettoolbox_unity"
+    targets = listOf("arm64", "arm", "x86_64", "x86")
+    apiLevel = 26
+    profile = "release"
+}
+
+val rustJniLibsDir = layout.buildDirectory.dir("rustJniLibs/android").get()
+tasks.matching { it.name.matches(Regex("merge.*JniLibFolders")) }.configureEach {
+    inputs.dir(rustJniLibsDir)
+    dependsOn("cargoBuild")
+}
+
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2026.06.00")
     implementation(composeBom)
@@ -52,8 +75,15 @@ dependencies {
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+    val cameraXVersion = "1.6.1"
+    implementation("androidx.camera:camera-camera2:$cameraXVersion")
+    implementation("androidx.camera:camera-lifecycle:$cameraXVersion")
+    implementation("androidx.camera:camera-view:$cameraXVersion")
     implementation("androidx.media3:media3-exoplayer:1.8.0")
-    implementation("androidx.exifinterface:exifinterface:1.4.1")
+    implementation("androidx.media3:media3-ui:1.8.0")
+    implementation("androidx.media3:media3-transformer:1.8.0")
+    implementation("androidx.documentfile:documentfile:1.1.0")
+    implementation("androidx.exifinterface:exifinterface:1.4.2")
     implementation("com.google.zxing:core:3.5.4")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 

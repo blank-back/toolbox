@@ -59,6 +59,13 @@ class LocalPreferences(context: Context) {
         preferences.edit().remove(KEY_QR_HISTORY).apply()
     }
 
+    fun loadQrSecurityDisclaimerAccepted(): Boolean =
+        preferences.getBoolean(KEY_QR_SECURITY_DISCLAIMER_ACCEPTED, false)
+
+    fun saveQrSecurityDisclaimerAccepted(accepted: Boolean) {
+        preferences.edit().putBoolean(KEY_QR_SECURITY_DISCLAIMER_ACCEPTED, accepted).apply()
+    }
+
     fun loadBiliHistory(): List<BiliHistoryEntry> = parseArray(KEY_BILI_HISTORY) { json ->
         BiliHistoryEntry(
             parsedAtEpochMillis = json.getLong("parsedAt"),
@@ -147,6 +154,34 @@ class LocalPreferences(context: Context) {
 
     fun clearDownloadTreeUri() {
         preferences.edit().remove(KEY_DOWNLOAD_TREE_URI).apply()
+    }
+
+    fun loadMediaScanTreeUri(): String? = preferences.getString(KEY_MEDIA_SCAN_TREE_URI, null)
+
+    fun saveMediaScanTreeUri(uri: String) {
+        preferences.edit().putString(KEY_MEDIA_SCAN_TREE_URI, uri).apply()
+    }
+
+    fun loadMediaExtensions(defaults: Set<String>): Set<String> {
+        val stored = preferences.getStringSet(KEY_MEDIA_EXTENSIONS, null) ?: return defaults
+        return stored.map { it.trim().lowercase() }.filter(String::isNotBlank).toSet()
+    }
+
+    fun saveMediaExtensions(extensions: Set<String>) {
+        preferences.edit().putStringSet(KEY_MEDIA_EXTENSIONS, extensions).apply()
+    }
+
+    fun loadGameExtractionTreeUri(): String? = preferences.getString(KEY_GAME_EXTRACTION_TREE_URI, null)
+
+    fun saveGameExtractionTreeUri(uri: String) {
+        preferences.edit().putString(KEY_GAME_EXTRACTION_TREE_URI, uri).apply()
+    }
+
+    fun loadGameExtractionDisclaimerAccepted(): Boolean =
+        preferences.getBoolean(KEY_GAME_EXTRACTION_DISCLAIMER_ACCEPTED, false)
+
+    fun saveGameExtractionDisclaimerAccepted(accepted: Boolean) {
+        preferences.edit().putBoolean(KEY_GAME_EXTRACTION_DISCLAIMER_ACCEPTED, accepted).apply()
     }
 
     fun loadDesktopLyricsEnabled(): Boolean =
@@ -240,12 +275,17 @@ class LocalPreferences(context: Context) {
     private companion object {
         const val PREFERENCES_NAME = "pocket_toolbox_local"
         const val KEY_QR_HISTORY = "qr_history_v1"
+        const val KEY_QR_SECURITY_DISCLAIMER_ACCEPTED = "qr_security_disclaimer_accepted_v1"
         const val KEY_BILI_HISTORY = "bili_history_v1"
         const val KEY_DOWNLOAD_TREE_URI = "download_tree_uri_v1"
         const val KEY_MUSIC_HISTORY = "music_history_v1"
         const val KEY_MUSIC_PLAYLISTS = "music_playlists_v1"
         const val KEY_DESKTOP_LYRICS_ENABLED = "desktop_lyrics_enabled_v1"
         const val KEY_MUSIC_SEARCH_SOURCE = "music_search_source_v1"
+        const val KEY_MEDIA_SCAN_TREE_URI = "media_scan_tree_uri_v1"
+        const val KEY_MEDIA_EXTENSIONS = "media_extensions_v1"
+        const val KEY_GAME_EXTRACTION_TREE_URI = "game_extraction_tree_uri_v1"
+        const val KEY_GAME_EXTRACTION_DISCLAIMER_ACCEPTED = "game_extraction_disclaimer_accepted_v1"
         const val DEFAULT_MUSIC_SEARCH_SOURCE = "netease"
         const val MAX_HISTORY_ITEMS = 100
         const val MAX_MUSIC_PLAYLISTS = 50

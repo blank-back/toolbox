@@ -53,6 +53,14 @@ data class QrUiState(
     val isError: Boolean = false,
 )
 
+data class QrGeneratorUiState(
+    val webUrl: String? = null,
+    val bitmap: Bitmap? = null,
+    val busy: Boolean = false,
+    val message: String? = null,
+    val isError: Boolean = false,
+)
+
 data class VirusTotalUiState(
     val busy: Boolean = false,
     val message: String? = null,
@@ -88,7 +96,7 @@ data class MusicUiState(
     val isError: Boolean = false,
 )
 
-@OptIn(UnstableApi::class)
+@androidx.annotation.OptIn(UnstableApi::class)
 class ToolboxViewModel(application: Application) : AndroidViewModel(application) {
     private val qrRepository = QrRepository(application)
     private val biliRepository = BiliRepository(application)
@@ -100,8 +108,17 @@ class ToolboxViewModel(application: Application) : AndroidViewModel(application)
     private val _qrState = MutableStateFlow(QrUiState())
     val qrState: StateFlow<QrUiState> = _qrState.asStateFlow()
 
+    private val _qrGeneratorState = MutableStateFlow(QrGeneratorUiState())
+    val qrGeneratorState: StateFlow<QrGeneratorUiState> = _qrGeneratorState.asStateFlow()
+
     private val _hasVirusTotalApiKey = MutableStateFlow(virusTotalApiKeyStore.hasApiKey())
     val hasVirusTotalApiKey: StateFlow<Boolean> = _hasVirusTotalApiKey.asStateFlow()
+
+    private val _qrSecurityDisclaimerAccepted = MutableStateFlow(
+        localPreferences.loadQrSecurityDisclaimerAccepted(),
+    )
+    val qrSecurityDisclaimerAccepted: StateFlow<Boolean> =
+        _qrSecurityDisclaimerAccepted.asStateFlow()
 
     private val _virusTotalStates = MutableStateFlow<Map<String, VirusTotalUiState>>(emptyMap())
     val virusTotalStates: StateFlow<Map<String, VirusTotalUiState>> = _virusTotalStates.asStateFlow()
@@ -164,26 +181,7 @@ class ToolboxViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             runCatching { qrRepository.scan(uri) }
                 .onSuccess { output ->
-                    val parsedAtEpochMillis = System.currentTimeMillis()
-                    if (output.results.isNotEmpty()) {
-                        _qrHistory.value = localPreferences.addQrHistory(
-                            results = output.results,
-                            parsedAtEpochMillis = parsedAtEpochMillis,
-                        )
-                    }
-                    _qrState.value = QrUiState(
-                        preview = output.preview,
-                        results = output.results,
-                        historyParsedAtEpochMillis = parsedAtEpochMillis.takeIf {
-                            output.results.isNotEmpty()
-                        },
-                        message = if (output.results.isEmpty()) {
-                            "没有识别到二维码。可尝试更清晰、边缘留白更多的原图。"
-                        } else {
-                            "识别到 ${output.results.size} 个二维码"
-                        },
-                        isError = output.results.isEmpty(),
-                    )
+                    publishQrOutput(output)
                 }
                 .onFailure { error ->
                     _qrState.value = QrUiState(
@@ -191,6 +189,133 @@ class ToolboxViewModel(application: Application) : AndroidViewModel(application)
                         isError = true,
                     )
                 }
+        }
+    }
+
+    /**
+     * Camera frames are sampled until one contains a QR code. Empty frames are
+     * intentionally not exposed to the UI or history, otherwise live scanning
+     * would repeatedly replace the user's previous result with an error.
+     */
+    fun scanQrCameraFrame(bitmap: Bitmap, onComplete: (found: Boolean) -> Unit) {
+        viewModelScope.launch {
+            val output = runCatching { qrRepository.scan(bitmap) }.getOrNull()
+            if (output != null && output.results.isNotEmpty()) {
+                _virusTotalStates.value = emptyMap()
+                publishQrOutput(output)
+                onComplete(true)
+            } else {
+                if (!bitmap.isRecycled) bitmap.recycle()
+                onComplete(false)
+            }
+        }
+    }
+
+    private fun publishQrOutput(output: QrRepository.ScanOutput) {
+        val parsedAtEpochMillis = System.currentTimeMillis()
+        if (output.results.isNotEmpty()) {
+            _qrHistory.value = localPreferences.addQrHistory(
+                results = output.results,
+                parsedAtEpochMillis = parsedAtEpochMillis,
+            )
+        }
+        _qrState.value = QrUiState(
+            preview = output.preview,
+            results = output.results,
+            historyParsedAtEpochMillis = parsedAtEpochMillis.takeIf {
+                output.results.isNotEmpty()
+            },
+            message = if (output.results.isEmpty()) {
+                "没有识别到二维码。可尝试更清晰、边缘留白更多的原图。"
+            } else {
+                "识别到 ${output.results.size} 个二维码"
+            },
+            isError = output.results.isEmpty(),
+        )
+    }
+
+    fun generateQrForUrl(value: String) {
+        if (_qrGeneratorState.value.busy) return
+        _qrGeneratorState.value = QrGeneratorUiState(busy = true, message = "正在本地生成二维码…")
+        viewModelScope.launch {
+            runCatching { qrRepository.generateWebUrl(value) }
+                .onSuccess { generated ->
+                    _qrGeneratorState.value = QrGeneratorUiState(
+                        webUrl = generated.webUrl,
+                        bitmap = generated.bitmap,
+                        message = "二维码已生成，可预览或手动保存为 PNG",
+                    )
+                }
+                .onFailure { error ->
+                    _qrGeneratorState.value = QrGeneratorUiState(
+                        message = error.readableMessage("无法生成二维码。"),
+                        isError = true,
+                    )
+                }
+        }
+    }
+
+    fun saveGeneratedQr(destination: Uri) {
+        val bitmap = _qrGeneratorState.value.bitmap ?: run {
+            _qrGeneratorState.update { it.copy(message = "请先生成二维码。", isError = true) }
+            return
+        }
+        if (_qrGeneratorState.value.busy) return
+        _qrGeneratorState.update { it.copy(busy = true, message = "正在保存二维码…", isError = false) }
+        viewModelScope.launch {
+            runCatching { qrRepository.saveGeneratedQr(bitmap, destination) }
+                .onSuccess {
+                    _qrGeneratorState.update { it.copy(busy = false, message = "二维码已保存。", isError = false) }
+                }
+                .onFailure { error ->
+                    _qrGeneratorState.update {
+                        it.copy(
+                            busy = false,
+                            message = error.readableMessage("无法保存二维码。"),
+                            isError = true,
+                        )
+                    }
+                }
+        }
+    }
+
+    fun prepareManualUrlForSecurity(value: String): String? {
+        if (!ensureQrSecurityDisclaimerAccepted()) return null
+        val webUrl = qrRepository.normalizeWebUrl(value)
+        if (webUrl == null) {
+            _qrState.update { it.copy(message = "请输入有效的 HTTP(S) 链接。", isError = true) }
+            return null
+        }
+        val current = _qrState.value
+        val alreadyPrepared = current.preview == null &&
+            current.results.size == 1 &&
+            current.results.single().webUrl == webUrl &&
+            current.historyParsedAtEpochMillis != null
+        val parsedAtEpochMillis = if (alreadyPrepared) {
+            requireNotNull(current.historyParsedAtEpochMillis)
+        } else {
+            System.currentTimeMillis().also { parsedAt ->
+                _qrHistory.value = localPreferences.addQrHistory(
+                    results = listOf(QrResult(webUrl, webUrl)),
+                    parsedAtEpochMillis = parsedAt,
+                )
+            }
+        }
+        _virusTotalStates.value = emptyMap()
+        _qrState.value = QrUiState(
+            results = listOf(QrResult(webUrl, webUrl)),
+            historyParsedAtEpochMillis = parsedAtEpochMillis,
+            message = "已载入手动输入链接，应用不会主动访问该地址。",
+        )
+        return webUrl
+    }
+
+    fun acceptQrSecurityDisclaimer() {
+        if (_qrSecurityDisclaimerAccepted.value) return
+        localPreferences.saveQrSecurityDisclaimerAccepted(true)
+        _qrSecurityDisclaimerAccepted.value = true
+        _qrState.update {
+            it.copy(message = "安全检测免责声明已阅，本次安装后无需重复确认。", isError = false)
         }
     }
 
@@ -230,6 +355,7 @@ class ToolboxViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun checkVirusTotal(url: String) {
+        if (!ensureQrSecurityDisclaimerAccepted()) return
         if (_virusTotalStates.value[url]?.busy == true) return
         val previousState = _virusTotalStates.value[url]
         val historyParsedAtEpochMillis = _qrState.value.historyParsedAtEpochMillis
@@ -297,6 +423,7 @@ class ToolboxViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun refreshVirusTotal(url: String) {
+        if (!ensureQrSecurityDisclaimerAccepted()) return
         val existing = _virusTotalStates.value[url] ?: VirusTotalUiState()
         if (existing.busy) return
         val historyParsedAtEpochMillis = _qrState.value.historyParsedAtEpochMillis
@@ -388,6 +515,17 @@ class ToolboxViewModel(application: Application) : AndroidViewModel(application)
         _virusTotalStates.update { states ->
             states + (url to transform(states[url] ?: VirusTotalUiState()))
         }
+    }
+
+    private fun ensureQrSecurityDisclaimerAccepted(): Boolean {
+        if (_qrSecurityDisclaimerAccepted.value) return true
+        _qrState.update {
+            it.copy(
+                message = "请先阅读安全检测免责声明。",
+                isError = true,
+            )
+        }
+        return false
     }
 
     private fun updateQrSecurityHistory(

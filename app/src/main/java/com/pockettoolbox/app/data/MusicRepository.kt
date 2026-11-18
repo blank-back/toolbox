@@ -34,7 +34,7 @@ import java.util.LinkedHashMap
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.coroutineContext
 
-@OptIn(UnstableApi::class)
+@androidx.annotation.OptIn(UnstableApi::class)
 class MusicRepository(private val context: Context) {
     data class PlayableAudio(
         val uri: Uri,

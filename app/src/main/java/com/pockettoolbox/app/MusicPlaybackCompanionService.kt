@@ -1,3 +1,5 @@
+@file:androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+
 package com.pockettoolbox.app
 
 import android.app.Notification
@@ -14,8 +16,11 @@ import android.graphics.drawable.GradientDrawable
 import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
+import android.net.Uri
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
 import android.view.MotionEvent
@@ -23,6 +28,13 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import com.pockettoolbox.app.model.LocalMediaItem
 import kotlin.math.roundToInt
 
 object MusicPlaybackCommandBus {
@@ -107,6 +119,21 @@ class MusicPlaybackCompanionService : Service() {
     private var hasPlaylistControls: Boolean = false
     private var positionMillis: Int = 0
     private var durationMillis: Int = 0
+    private var playbackMode = PlaybackTarget.MUSIC
+    private var localPlayer: ExoPlayer? = null
+    private var localUri: String? = null
+    private var localIsVideo = false
+    private var localWidth = 0
+    private var localHeight = 0
+    private val progressHandler = Handler(Looper.getMainLooper())
+    private val progressTicker = object : Runnable {
+        override fun run() {
+            if (playbackMode == PlaybackTarget.LOCAL_MEDIA && localPlayer != null) {
+                syncLocalPlayerState(refreshNotification = true)
+                progressHandler.postDelayed(this, LOCAL_PROGRESS_INTERVAL_MS)
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -116,27 +143,30 @@ class MusicPlaybackCompanionService : Service() {
         mediaSession = MediaSession(this, "PocketToolboxMusic").apply {
             setCallback(object : MediaSession.Callback() {
                 override fun onPlay() {
-                    if (!this@MusicPlaybackCompanionService.isPlaying) MusicPlaybackCommandBus.toggle()
+                    togglePlayback(playOnly = true)
                 }
 
                 override fun onPause() {
-                    if (this@MusicPlaybackCompanionService.isPlaying) MusicPlaybackCommandBus.toggle()
+                    pausePlayback()
                 }
 
                 override fun onStop() {
-                    MusicPlaybackCommandBus.stop()
+                    stopCurrentPlayback()
                 }
 
                 override fun onSkipToPrevious() {
-                    MusicPlaybackCommandBus.previous()
+                    if (playbackMode == PlaybackTarget.LOCAL_MEDIA) seekLocalBy(-LOCAL_SEEK_MILLIS)
+                    else MusicPlaybackCommandBus.previous()
                 }
 
                 override fun onSkipToNext() {
-                    MusicPlaybackCommandBus.next()
+                    if (playbackMode == PlaybackTarget.LOCAL_MEDIA) seekLocalBy(LOCAL_SEEK_MILLIS)
+                    else MusicPlaybackCommandBus.next()
                 }
 
                 override fun onSeekTo(pos: Long) {
-                    MusicPlaybackCommandBus.seekTo(pos)
+                    if (playbackMode == PlaybackTarget.LOCAL_MEDIA) localPlayer?.seekTo(pos)
+                    else MusicPlaybackCommandBus.seekTo(pos)
                 }
             })
             isActive = true
@@ -145,16 +175,42 @@ class MusicPlaybackCompanionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent == null && localPlayer == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
         when (intent?.action) {
-            ACTION_TOGGLE -> MusicPlaybackCommandBus.toggle()
-            ACTION_PREVIOUS -> MusicPlaybackCommandBus.previous()
-            ACTION_NEXT -> MusicPlaybackCommandBus.next()
+            ACTION_TOGGLE -> togglePlayback()
+            ACTION_PREVIOUS -> if (playbackMode == PlaybackTarget.LOCAL_MEDIA) {
+                seekLocalBy(-LOCAL_SEEK_MILLIS)
+            } else MusicPlaybackCommandBus.previous()
+            ACTION_NEXT -> if (playbackMode == PlaybackTarget.LOCAL_MEDIA) {
+                seekLocalBy(LOCAL_SEEK_MILLIS)
+            } else MusicPlaybackCommandBus.next()
+            ACTION_PLAY_LOCAL -> readLocalRequest(intent)
+            ACTION_REPLAY_LOCAL -> localPlayer?.let { player -> player.seekTo(0); player.play() }
+            ACTION_SET_LOCAL_SPEED -> setLocalSpeed(intent.getFloatExtra(EXTRA_SPEED, 1f))
+            ACTION_SEEK_LOCAL_TO -> localPlayer?.seekTo(intent.getLongExtra(EXTRA_SEEK_POSITION, 0L))
+            ACTION_STOP_MUSIC -> {
+                if (playbackMode == PlaybackTarget.MUSIC) {
+                    stopAndRemoveUi()
+                    return START_NOT_STICKY
+                }
+            }
+            ACTION_STOP_LOCAL -> {
+                if (playbackMode == PlaybackTarget.LOCAL_MEDIA) {
+                    stopLocalPlayer(publishEmptyState = true)
+                    stopAndRemoveUi()
+                    return START_NOT_STICKY
+                }
+            }
             ACTION_STOP_PLAYBACK -> {
-                MusicPlaybackCommandBus.stop()
+                stopCurrentPlayback()
                 stopAndRemoveUi()
                 return START_NOT_STICKY
             }
             ACTION_TOGGLE_DESKTOP_LYRICS -> {
+                if (playbackMode == PlaybackTarget.LOCAL_MEDIA) return START_STICKY
                 val requestedEnabled = !desktopLyricsEnabled
                 if (!requestedEnabled || Settings.canDrawOverlays(this)) {
                     desktopLyricsEnabled = requestedEnabled
@@ -165,25 +221,16 @@ class MusicPlaybackCompanionService : Service() {
             ACTION_UPDATE -> intent?.let(::readSnapshot)
         }
 
-        updateMediaSession()
-        val notification = buildNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
-        }
-        updateOverlay()
-        return START_NOT_STICKY
+        refreshForeground()
+        return if (playbackMode == PlaybackTarget.LOCAL_MEDIA) START_STICKY else START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
         isRunning = false
+        stopLocalPlayer(publishEmptyState = false)
+        LocalMediaPlaybackBus.publishState(LocalPlaybackState())
         removeOverlay()
         mediaSession.isActive = false
         mediaSession.release()
@@ -197,6 +244,8 @@ class MusicPlaybackCompanionService : Service() {
     }
 
     private fun readSnapshot(intent: Intent) {
+        stopLocalPlayer(publishEmptyState = true)
+        playbackMode = PlaybackTarget.MUSIC
         title = intent.getStringExtra(EXTRA_TITLE).orEmpty().ifBlank { "正在播放" }
         artist = intent.getStringExtra(EXTRA_ARTIST).orEmpty().ifBlank { "未知歌手" }
         album = intent.getStringExtra(EXTRA_ALBUM).orEmpty()
@@ -211,10 +260,10 @@ class MusicPlaybackCompanionService : Service() {
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             NOTIFICATION_CHANNEL_ID,
-            "音乐播放",
+            "媒体播放",
             NotificationManager.IMPORTANCE_LOW,
         ).apply {
-            description = "显示当前歌曲、歌词和播放控制"
+            description = "显示在线音乐或本地媒体的播放状态与控制"
             setSound(null, null)
             enableVibration(false)
             setShowBadge(false)
@@ -228,6 +277,7 @@ class MusicPlaybackCompanionService : Service() {
             REQUEST_OPEN_APP,
             Intent(this, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra(PlaybackNavigationBus.EXTRA_TARGET, playbackMode.name)
             },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -268,12 +318,12 @@ class MusicPlaybackCompanionService : Service() {
         ).build()
         val previousAction = Notification.Action.Builder(
             R.drawable.ic_notification_previous,
-            "上一首",
+            if (playbackMode == PlaybackTarget.LOCAL_MEDIA) "后退 10 秒" else "上一首",
             previousIntent,
         ).build()
         val nextAction = Notification.Action.Builder(
             R.drawable.ic_notification_next,
-            "下一首",
+            if (playbackMode == PlaybackTarget.LOCAL_MEDIA) "快进 10 秒" else "下一首",
             nextIntent,
         ).build()
         val desktopLyricsAction = Notification.Action.Builder(
@@ -290,12 +340,20 @@ class MusicPlaybackCompanionService : Service() {
             "停止",
             stopIntent,
         ).build()
-        val details = listOf(artist, album.takeIf(String::isNotBlank)).filterNotNull().joinToString(" · ")
+        val details = if (playbackMode == PlaybackTarget.LOCAL_MEDIA) {
+            listOf(if (localIsVideo) "本地视频" else "本地音频", artist).filter(String::isNotBlank).joinToString(" · ")
+        } else {
+            listOf(artist, album.takeIf(String::isNotBlank)).filterNotNull().joinToString(" · ")
+        }
         return Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification_music)
             .setContentTitle(title)
             .setContentText(details)
-            .setSubText(lyric.replace('\n', ' ').take(MAX_NOTIFICATION_LYRIC_LENGTH))
+            .setSubText(
+                if (playbackMode == PlaybackTarget.LOCAL_MEDIA) {
+                    "${formatClock(positionMillis)} / ${formatClock(durationMillis)}"
+                } else lyric.replace('\n', ' ').take(MAX_NOTIFICATION_LYRIC_LENGTH),
+            )
             .setContentIntent(contentIntent)
             .setCategory(Notification.CATEGORY_TRANSPORT)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
@@ -304,11 +362,18 @@ class MusicPlaybackCompanionService : Service() {
             .setShowWhen(false)
             .setColor(Color.rgb(231, 111, 60))
             .apply {
-                if (hasPlaylistControls) addAction(previousAction)
-                addAction(toggleAction)
-                if (hasPlaylistControls) addAction(nextAction)
-                addAction(desktopLyricsAction)
-                addAction(stopAction)
+                if (playbackMode == PlaybackTarget.LOCAL_MEDIA) {
+                    addAction(previousAction)
+                    addAction(toggleAction)
+                    addAction(nextAction)
+                    addAction(stopAction)
+                } else {
+                    if (hasPlaylistControls) addAction(previousAction)
+                    addAction(toggleAction)
+                    if (hasPlaylistControls) addAction(nextAction)
+                    addAction(desktopLyricsAction)
+                    addAction(stopAction)
+                }
                 setStyle(
                     Notification.MediaStyle()
                         .setMediaSession(mediaSession.sessionToken)
@@ -333,7 +398,7 @@ class MusicPlaybackCompanionService : Service() {
             PlaybackState.ACTION_PLAY_PAUSE or
             PlaybackState.ACTION_STOP or
             PlaybackState.ACTION_SEEK_TO
-        if (hasPlaylistControls) {
+        if (hasPlaylistControls || playbackMode == PlaybackTarget.LOCAL_MEDIA) {
             actions = actions or PlaybackState.ACTION_SKIP_TO_PREVIOUS or PlaybackState.ACTION_SKIP_TO_NEXT
         }
         mediaSession.setPlaybackState(
@@ -346,6 +411,144 @@ class MusicPlaybackCompanionService : Service() {
                 )
                 .build(),
         )
+    }
+
+    private fun readLocalRequest(intent: Intent) {
+        val uriText = intent.getStringExtra(EXTRA_LOCAL_URI).orEmpty()
+        if (uriText.isBlank()) return
+        MusicPlaybackCommandBus.stop()
+        stopLocalPlayer(publishEmptyState = false)
+        playbackMode = PlaybackTarget.LOCAL_MEDIA
+        localUri = uriText
+        localIsVideo = intent.getBooleanExtra(EXTRA_LOCAL_IS_VIDEO, false)
+        localWidth = intent.getIntExtra(EXTRA_LOCAL_WIDTH, 0).coerceAtLeast(0)
+        localHeight = intent.getIntExtra(EXTRA_LOCAL_HEIGHT, 0).coerceAtLeast(0)
+        title = intent.getStringExtra(EXTRA_LOCAL_TITLE).orEmpty().ifBlank { "本地媒体" }
+        artist = "1.00×"
+        album = ""
+        lyric = ""
+        desktopLyricsEnabled = false
+        hasPlaylistControls = false
+        removeOverlay()
+
+        val player = ExoPlayer.Builder(this).build().apply {
+            setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(C.USAGE_MEDIA)
+                    .setContentType(if (localIsVideo) C.AUDIO_CONTENT_TYPE_MOVIE else C.AUDIO_CONTENT_TYPE_MUSIC)
+                    .build(),
+                true,
+            )
+            setHandleAudioBecomingNoisy(true)
+            setWakeMode(C.WAKE_MODE_LOCAL)
+            addListener(object : Player.Listener {
+                override fun onEvents(player: Player, events: Player.Events) {
+                    syncLocalPlayerState(refreshNotification = true)
+                }
+
+                override fun onPlayerError(error: PlaybackException) {
+                    syncLocalPlayerState(refreshNotification = true, error = error.message ?: "无法播放此媒体")
+                }
+            })
+            val metadata = androidx.media3.common.MediaMetadata.Builder()
+                .setTitle(title)
+                .setArtist(if (localIsVideo) "本地视频" else "本地音频")
+                .build()
+            setMediaItem(MediaItem.Builder().setUri(Uri.parse(uriText)).setMediaMetadata(metadata).build())
+            prepare()
+            playWhenReady = true
+        }
+        localPlayer = player
+        LocalMediaPlaybackBus.publishPlayer(player)
+        progressHandler.removeCallbacks(progressTicker)
+        progressHandler.post(progressTicker)
+        syncLocalPlayerState(refreshNotification = false)
+    }
+
+    private fun togglePlayback(playOnly: Boolean = false) {
+        if (playbackMode == PlaybackTarget.LOCAL_MEDIA) {
+            localPlayer?.let { player ->
+                if (playOnly || !player.isPlaying) player.play() else player.pause()
+            }
+        } else if (!playOnly || !isPlaying) {
+            MusicPlaybackCommandBus.toggle()
+        }
+    }
+
+    private fun pausePlayback() {
+        if (playbackMode == PlaybackTarget.LOCAL_MEDIA) localPlayer?.pause()
+        else if (isPlaying) MusicPlaybackCommandBus.toggle()
+    }
+
+    private fun stopCurrentPlayback() {
+        if (playbackMode == PlaybackTarget.LOCAL_MEDIA) stopLocalPlayer(publishEmptyState = true)
+        else MusicPlaybackCommandBus.stop()
+    }
+
+    private fun seekLocalBy(deltaMillis: Long) {
+        localPlayer?.let { player ->
+            val duration = player.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: Long.MAX_VALUE
+            player.seekTo((player.currentPosition + deltaMillis).coerceIn(0L, duration))
+        }
+    }
+
+    private fun setLocalSpeed(speed: Float) {
+        localPlayer?.setPlaybackSpeed(speed.coerceIn(0.25f, 3f))
+        syncLocalPlayerState(refreshNotification = true)
+    }
+
+    private fun syncLocalPlayerState(refreshNotification: Boolean, error: String? = null) {
+        val player = localPlayer ?: return
+        val safeDuration = player.duration.takeIf { it != C.TIME_UNSET && it > 0L } ?: 0L
+        val speed = player.playbackParameters.speed
+        isPlaying = player.isPlaying
+        positionMillis = player.currentPosition.coerceAtLeast(0L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        durationMillis = safeDuration.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        artist = "${"%.2f".format(speed)}×"
+        LocalMediaPlaybackBus.publishState(
+            LocalPlaybackState(
+                uri = localUri,
+                title = title,
+                isVideo = localIsVideo,
+                width = localWidth,
+                height = localHeight,
+                isPlaying = isPlaying,
+                positionMillis = player.currentPosition.coerceAtLeast(0L),
+                durationMillis = safeDuration,
+                speed = speed,
+                error = error,
+            ),
+        )
+        if (refreshNotification && ::notificationManager.isInitialized) {
+            updateMediaSession()
+            notificationManager.notify(NOTIFICATION_ID, buildNotification())
+        }
+    }
+
+    private fun stopLocalPlayer(publishEmptyState: Boolean) {
+        progressHandler.removeCallbacks(progressTicker)
+        val player = localPlayer
+        localPlayer = null
+        player?.release()
+        localUri = null
+        LocalMediaPlaybackBus.publishPlayer(null)
+        if (publishEmptyState) LocalMediaPlaybackBus.publishState(LocalPlaybackState())
+    }
+
+    private fun refreshForeground() {
+        updateMediaSession()
+        val notification = buildNotification()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+        if (playbackMode == PlaybackTarget.MUSIC) updateOverlay() else removeOverlay()
+    }
+
+    private fun formatClock(milliseconds: Int): String {
+        val totalSeconds = milliseconds.coerceAtLeast(0) / 1_000
+        return "%d:%02d".format(totalSeconds / 60, totalSeconds % 60)
     }
 
     private fun updateOverlay() {
@@ -469,6 +672,8 @@ class MusicPlaybackCompanionService : Service() {
         private const val REQUEST_PREVIOUS = 3206
         private const val REQUEST_NEXT = 3207
         private const val MAX_NOTIFICATION_LYRIC_LENGTH = 80
+        private const val LOCAL_SEEK_MILLIS = 10_000L
+        private const val LOCAL_PROGRESS_INTERVAL_MS = 500L
 
         private const val ACTION_UPDATE = "com.pockettoolbox.app.music.UPDATE"
         private const val ACTION_TOGGLE = "com.pockettoolbox.app.music.TOGGLE"
@@ -476,6 +681,12 @@ class MusicPlaybackCompanionService : Service() {
         private const val ACTION_NEXT = "com.pockettoolbox.app.music.NEXT"
         private const val ACTION_STOP_PLAYBACK = "com.pockettoolbox.app.music.STOP"
         private const val ACTION_TOGGLE_DESKTOP_LYRICS = "com.pockettoolbox.app.music.TOGGLE_DESKTOP_LYRICS"
+        private const val ACTION_PLAY_LOCAL = "com.pockettoolbox.app.local.PLAY"
+        private const val ACTION_REPLAY_LOCAL = "com.pockettoolbox.app.local.REPLAY"
+        private const val ACTION_SET_LOCAL_SPEED = "com.pockettoolbox.app.local.SET_SPEED"
+        private const val ACTION_SEEK_LOCAL_TO = "com.pockettoolbox.app.local.SEEK_TO"
+        private const val ACTION_STOP_LOCAL = "com.pockettoolbox.app.local.STOP"
+        private const val ACTION_STOP_MUSIC = "com.pockettoolbox.app.music.STOP_MODE"
         private const val EXTRA_TITLE = "title"
         private const val EXTRA_ARTIST = "artist"
         private const val EXTRA_ALBUM = "album"
@@ -485,6 +696,13 @@ class MusicPlaybackCompanionService : Service() {
         private const val EXTRA_HAS_PLAYLIST_CONTROLS = "has_playlist_controls"
         private const val EXTRA_POSITION = "position"
         private const val EXTRA_DURATION = "duration"
+        private const val EXTRA_LOCAL_URI = "local_uri"
+        private const val EXTRA_LOCAL_TITLE = "local_title"
+        private const val EXTRA_LOCAL_IS_VIDEO = "local_is_video"
+        private const val EXTRA_LOCAL_WIDTH = "local_width"
+        private const val EXTRA_LOCAL_HEIGHT = "local_height"
+        private const val EXTRA_SPEED = "speed"
+        private const val EXTRA_SEEK_POSITION = "seek_position"
 
         @Volatile
         private var isRunning = false
@@ -522,7 +740,62 @@ class MusicPlaybackCompanionService : Service() {
         }
 
         fun stop(context: Context) {
-            runCatching { context.stopService(Intent(context, MusicPlaybackCompanionService::class.java)) }
+            if (!isRunning) return
+            runCatching {
+                context.startService(
+                    Intent(context, MusicPlaybackCompanionService::class.java).setAction(ACTION_STOP_MUSIC),
+                )
+            }
+        }
+
+        fun playLocal(context: Context, item: LocalMediaItem) {
+            val intent = Intent(context, MusicPlaybackCompanionService::class.java)
+                .setAction(ACTION_PLAY_LOCAL)
+                .putExtra(EXTRA_LOCAL_URI, item.uri)
+                .putExtra(EXTRA_LOCAL_TITLE, item.name)
+                .putExtra(EXTRA_LOCAL_IS_VIDEO, item.isVideo)
+                .putExtra(EXTRA_LOCAL_WIDTH, item.width)
+                .putExtra(EXTRA_LOCAL_HEIGHT, item.height)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !isRunning) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            }
+        }
+
+        fun toggleLocal(context: Context) = sendLocalCommand(context, ACTION_TOGGLE)
+
+        fun replayLocal(context: Context) = sendLocalCommand(context, ACTION_REPLAY_LOCAL)
+
+        fun seekLocalTo(context: Context, positionMillis: Long) {
+            sendLocalCommand(
+                context,
+                ACTION_SEEK_LOCAL_TO,
+                Intent().putExtra(EXTRA_SEEK_POSITION, positionMillis.coerceAtLeast(0L)),
+            )
+        }
+
+        fun setLocalSpeed(context: Context, speed: Float) {
+            sendLocalCommand(
+                context,
+                ACTION_SET_LOCAL_SPEED,
+                Intent().putExtra(EXTRA_SPEED, speed.coerceIn(0.25f, 3f)),
+            )
+        }
+
+        fun seekLocalBy(context: Context, forward: Boolean) {
+            sendLocalCommand(context, if (forward) ACTION_NEXT else ACTION_PREVIOUS)
+        }
+
+        fun stopLocal(context: Context) = sendLocalCommand(context, ACTION_STOP_LOCAL)
+
+        private fun sendLocalCommand(context: Context, action: String, extras: Intent? = null) {
+            if (!isRunning) return
+            val intent = Intent(context, MusicPlaybackCompanionService::class.java).setAction(action)
+            extras?.extras?.let(intent::putExtras)
+            runCatching { context.startService(intent) }
         }
     }
 }
